@@ -124,7 +124,7 @@ async function renderOverview(host: HTMLElement) {
     card({
       title: "Invite a teammate",
       action: h("button", { class: "primary", onClick: () => openInvite(host) }, "Invite staff"),
-      body: h("p", { class: "bv-muted" }, "Create custom roles with the exact permissions each person needs, then send an invite link."),
+      body: h("p", { class: "bv-muted" }, "Define roles and build your staff roster, then share an invite link. This is your team directory — roles document who does what; they don't yet grant Inkress dashboard logins."),
     }),
   );
 

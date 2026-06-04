@@ -73,6 +73,11 @@ CREATE TABLE IF NOT EXISTS staff (
 );
 CREATE INDEX IF NOT EXISTS roles_merchant_idx ON roles (merchant_id);
 CREATE INDEX IF NOT EXISTS staff_merchant_idx ON staff (merchant_id, status);
+CREATE TABLE IF NOT EXISTS merchant_meta (
+  merchant_id bigint PRIMARY KEY,
+  name        text,
+  updated_at  timestamptz NOT NULL DEFAULT now()
+);
 `;
 
 const app = express();
@@ -86,6 +91,21 @@ const core = mountAppCore(app, {
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 const db = await openPg("team_access", SCHEMA);
+
+// One-time: earlier builds allowed duplicate role names (you'd see two
+// identical "Shift Lead" roles and couldn't tell them apart). Suffix the
+// duplicates so every name is distinct; uniqueness is enforced going forward.
+async function runMigrations() {
+  await db.run(`CREATE TABLE IF NOT EXISTS _migrations (id text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())`);
+  if (await db.one(`SELECT 1 FROM _migrations WHERE id='dedupe_role_names_v1'`)) return;
+  await db.run(`
+    UPDATE roles r SET name = r.name || ' ' || sub.rn
+      FROM (SELECT id, row_number() OVER (PARTITION BY merchant_id, lower(name) ORDER BY created_at, id) AS rn
+              FROM roles) sub
+     WHERE r.id = sub.id AND sub.rn > 1`);
+  await db.run(`INSERT INTO _migrations (id) VALUES ('dedupe_role_names_v1') ON CONFLICT DO NOTHING`);
+}
+await runMigrations();
 
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 const int = (v, d) => {
@@ -110,6 +130,7 @@ async function ensureSeed(mid) {
 app.get("/api/overview", core.requireSession, async (req, res) => {
   try {
     const mid = req.session.merchantId;
+    await db.run("INSERT INTO merchant_meta (merchant_id, name) VALUES ($1,$2) ON CONFLICT (merchant_id) DO UPDATE SET name=$2, updated_at=now()", [mid, req.session.merchant?.name || null]).catch(() => {});
     await ensureSeed(mid);
     const stats = await db.one(
       `SELECT
@@ -149,6 +170,8 @@ app.post("/api/roles", core.requireSession, async (req, res) => {
   const b = req.body || {};
   const name = String(b.name || "Role").slice(0, 60);
   const perms = JSON.stringify(cleanPerms(b.permissions));
+  const dup = await db.one("SELECT id FROM roles WHERE merchant_id=$1 AND lower(name)=lower($2) AND id<>$3", [mid, name, int(b.id, 0)]);
+  if (dup) return res.status(422).json({ error: "A role with that name already exists." });
   if (b.id) {
     await db.run("UPDATE roles SET name=$2, permissions=$3 WHERE id=$1 AND merchant_id=$4 AND is_system=false", [int(b.id, 0), name, perms, mid]);
   } else {
@@ -224,14 +247,17 @@ function page(body) {
 
 app.get("/invite/:token", async (req, res) => {
   const s = await db.one(
-    "SELECT s.*, r.name AS role FROM staff s LEFT JOIN roles r ON r.id=s.role_id WHERE s.invite_token=$1",
+    "SELECT s.*, r.name AS role, mm.name AS business FROM staff s LEFT JOIN roles r ON r.id=s.role_id LEFT JOIN merchant_meta mm ON mm.merchant_id=s.merchant_id WHERE s.invite_token=$1",
     [req.params.token],
   );
   if (!s) return res.status(404).send(page("<h1>Invite not found</h1><p class=muted>This invite link is invalid.</p>"));
   if (s.status !== "invited") return res.send(page("<h1>Already accepted</h1><p class=muted>This invite has already been used.</p>"));
+  const invited = s.business
+    ? `<strong>${esc(s.business)}</strong> has invited you to join their team${s.role ? ` as <strong>${esc(s.role)}</strong>` : ""}.`
+    : `You've been invited to join the team${s.role ? ` as <strong>${esc(s.role)}</strong>` : ""}.`;
   res.send(page(`
     <h1>You're invited 👋</h1>
-    <p class=muted>You've been invited to join the team.</p>
+    <p class=muted>${invited}</p>
     ${s.role ? `<div class=role>${esc(s.role)}</div>` : ""}
     <form method=post action="/invite/${esc(req.params.token)}">
       <label>Your name</label>
@@ -246,7 +272,9 @@ app.post("/invite/:token", async (req, res) => {
   if (s.status !== "invited") return res.send(page("<h1>Already accepted</h1>"));
   const name = String(req.body?.name || "").slice(0, 120).trim() || s.name || "Team member";
   await db.run("UPDATE staff SET name=$2, status='active', accepted_at=now() WHERE id=$1", [s.id, name]);
-  res.send(page(`<h1>Welcome aboard, ${esc(name)}! 🎉</h1><p class=muted>Your access is active. You can close this page.</p>`));
+  const mm = await db.one("SELECT name FROM merchant_meta WHERE merchant_id=$1", [s.merchant_id]);
+  const biz = mm?.name ? esc(mm.name) : "the team";
+  res.send(page(`<h1>Welcome aboard, ${esc(name)}! 🎉</h1><p class=muted>You're now listed on ${biz}'s team roster. Any system logins (such as your own Inkress dashboard account) are set up separately by your manager — this just confirms your place on the team.</p>`));
 });
 
 app.listen(PORT, HOST, () => console.log(`[team-access] listening on ${HOST}:${PORT}`));
