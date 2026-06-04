@@ -130,7 +130,8 @@ async function ensureSeed(mid) {
 app.get("/api/overview", core.requireSession, async (req, res) => {
   try {
     const mid = req.session.merchantId;
-    await db.run("INSERT INTO merchant_meta (merchant_id, name) VALUES ($1,$2) ON CONFLICT (merchant_id) DO UPDATE SET name=$2, updated_at=now()", [mid, req.session.merchant?.name || null]).catch(() => {});
+    const _m = req.session.data?.merchant || req.session.merchant || {};
+    await db.run("INSERT INTO merchant_meta (merchant_id, name) VALUES ($1,$2) ON CONFLICT (merchant_id) DO UPDATE SET name=$2, updated_at=now()", [mid, _m.name || null]).catch(() => {});
     await ensureSeed(mid);
     const stats = await db.one(
       `SELECT
